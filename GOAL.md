@@ -51,7 +51,7 @@ Inspired by Stanford's [Alpa](https://github.com/alpa-projects/alpa), but at a h
 | Resource | Specs | Status |
 |----------|-------|--------|
 | Google TRC TPUs | 16× TPU v5e | Temporarily reclaimed |
-| Ye's GPU | RTX 5090 | Available for single-GPU dev |
+| Ye's Workstation | 8× RTX PRO 6000 Blackwell (96GB each) | Available |
 | Rice Cluster | L40S nodes | Access pending (VPN/SSH forwarding needed) |
 
 ## Immediate Tasks

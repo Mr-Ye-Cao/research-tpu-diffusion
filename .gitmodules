@@ -1,0 +1,3 @@
+[submodule "Multi-Sharding-MaxDiffusion"]
+	path = Multi-Sharding-MaxDiffusion
+	url = https://github.com/AlbedoWang/Multi-Sharding-MaxDiffusion.git
