@@ -35,6 +35,21 @@ conda activate tpu-diffusion
 
 ### NCCL Multi-GPU Issue on Blackwell (2026-01-05)
 - **Problem:** JAX/XLA NCCL operations fail with `corrupted comm object` on Blackwell GPUs (compute capability 12.0)
-- **Impact:** Multi-GPU MaxDiffusion inference fails; single-GPU works fine
-- **Status:** Blocked - likely requires JAX/XLA update for Blackwell support
-- **Workaround:** Use single GPU with `CUDA_VISIBLE_DEVICES=0`
+- **Impact:** Multi-GPU MaxDiffusion inference fails for ALL models (Wan, SDXL, etc.); single-GPU works fine
+- **Status:** Blocked - JAX/XLA bug for large compiled programs on Blackwell
+
+**Investigation findings:**
+- Simple JAX NCCL collectives (all-reduce, all-gather) work fine
+- nnx.merge, scan layers, attention all work in isolation
+- The issue triggers when executing large XLA-compiled programs with NCCL
+- Affects all parallelism modes (FSDP, DP, TP)
+- NCCL version 2.28.9 with CUDA 12.8/12.9
+
+**Root cause:** Likely a bug in JAX's XLA PJRT NCCL bindings for Blackwell (sm_120). The NCCL communicator initializes successfully but corrupts during execution of complex compiled graphs.
+
+**Workaround:** Use single GPU with `CUDA_VISIBLE_DEVICES=0`
+
+**Next steps:**
+- File issue on JAX GitHub: https://github.com/jax-ml/jax/issues
+- Monitor for JAX updates with Blackwell fixes
+- Test on older GPUs (L40S, A100) which should work
