@@ -33,13 +33,15 @@ conda activate tpu-diffusion
 
 ## Known Issues
 
-### NCCL Multi-GPU Issue on Blackwell (2026-01-05) - COMPREHENSIVE INVESTIGATION
+### NCCL Multi-GPU Issue on GPU (2026-01-05) - COMPREHENSIVE INVESTIGATION
 
-**Problem:** JAX/XLA NCCL operations fail with `corrupted comm object` on Blackwell GPUs (compute capability 12.0)
+**Problem:** JAX/XLA NCCL operations fail with `corrupted comm object` on multiple GPU architectures
 
 **Impact:** Multi-GPU MaxDiffusion inference fails for ALL models (Wan, SDXL, etc.); single-GPU works fine
 
-**Status:** CONFIRMED BUG - XLA/PJRT NCCL communicator race condition on Blackwell
+**Status:** ✅ FIXED - XLA/PJRT NCCL communicator race condition (workaround found)
+
+**CRITICAL UPDATE (2026-01-05):** Issue also affects H100 GPUs (compute capability 9.0), not just Blackwell. Tested on UCSD cluster node sn4622120245 with 8× H100 80GB HBM3.
 
 **Root Cause (identified 2026-01-05):**
 Race condition in XLA's PJRT client where execution threads try to use NCCL communicators BEFORE initialization threads complete setup. Analysis of NCCL DEBUG logs shows:
@@ -63,11 +65,17 @@ NCCL operation ncclCommCount(comm_, &count) failed: invalid argument
    - Transformer-like modules (2-30 layers) with sharding constraints
    - Batched `jax.device_put()` with 500+ params (~14GB)
    - All tested with `test_nccl_minimal.py`, `test_batched_sharding.py`
+   - Single-GPU MaxDiffusion inference (verified on H100)
 
 2. **What FAILS:**
    - MaxDiffusion inference (ALL models: Wan 1.3B, SDXL)
    - Fails with ANY number of GPUs (2, 4, 8)
-   - The NCCL communicator initializes successfully but XLA tries to use it before init completes
+   - Fails on BOTH H100 and Blackwell GPUs
+   - Multiple error types observed:
+     - `ncclCommCount(comm_, &count) failed: invalid argument`
+     - `ncclCommSplit(...) failed: invalid argument`
+     - `ncclSend/ncclRecv failed: invalid argument`
+   - "Call to bind failed: Address already in use" when NCCL RAS enabled (fix: `NCCL_RAS_ENABLE=0`)
 
 3. **XLA Source Analysis (xla/xla/backends/gpu/collectives/):**
    - `nccl_communicator.h:207-222`: Documents NCCL thread safety requirements
@@ -110,18 +118,57 @@ NCCL operation ncclCommCount(comm_, &count) failed: invalid argument
    - RTX PRO 6000 Blackwell (compute capability 12.0, sm_120)
    - Python 3.11, Flax 0.12.2
 
-**Workaround:** Use single GPU: `CUDA_VISIBLE_DEVICES=0`
+**Workaround (OLD):** Use single GPU: `CUDA_VISIBLE_DEVICES=0`
+
+**FIX (VERIFIED):** Add `_ = jax.devices()` immediately after `import jax` - see "FIX FOUND" section below.
 
 **Test files:**
 - `Multi-Sharding-MaxDiffusion/test_nccl_minimal.py` - Minimal tests (ALL PASS)
 - `Multi-Sharding-MaxDiffusion/run_debug.sh` - Debug script for MaxDiffusion
 
+**H100 Testing (2026-01-05, UCSD cluster):**
+- Environment: sn4622120245, 8× H100 80GB HBM3, JAX 0.8.1, NCCL 2.28.9
+- Single-GPU: WORKS (compile: 41s, generation: 6.4s)
+- Multi-GPU (2-4 GPUs): FAILS with same NCCL errors as Blackwell
+- Basic NCCL tests (psum, all_gather, sharded matmul): ALL PASS
+- Model: `/scr/dataset/kaijian/huggingface/hub/models--Wan-AI--Wan2.1-T2V-1.3B-Diffusers`
+
+**H100 Workarounds Tested (ALL FAILED):**
+- `NCCL_RAS_ENABLE=0` - Fixes "Address already in use" but still fails
+- `NCCL_P2P_DISABLE=1 + NCCL_SHM_DISABLE=1` - No effect
+- `NCCL_CUMEM_ENABLE=0 + NCCL_NET_GDR_LEVEL=0` - No effect
+- `NCCL_LAUNCH_MODE=PARALLEL` - No effect
+- `--xla_gpu_enable_nccl_comm_splitting=false` - No effect
+- `--xla_gpu_enable_command_buffer=` (empty) - No effect
+- `--xla_gpu_collectives_use_persistent_cliques=true` - No effect
+- `JAX_USE_SHARDY_PARTITIONER=0` - No effect
+- `JAX_COMPILATION_CACHE_DIR=""` - No effect
+- Older JAX (0.4.35) - Incompatible with current flax/maxdiffusion
+- NCCL version downgrades (2.18.3, 2.19.3, 2.27.5) - All fail with same error
+
+**Note:** CUDA runtime 12.9 vs Driver 12.2 mismatch was suspected but NCCL downgrades did not help - issue is in JAX/XLA PJRT layer, not NCCL compatibility.
+
+**FIX FOUND (2026-01-06):**
+Add `_ = jax.devices()` immediately after `import jax` to force early device initialization:
+```python
+import jax
+_ = jax.devices()  # Force early device initialization to avoid NCCL race condition
+```
+This bypasses the race condition where execution threads try to use NCCL communicators before initialization completes.
+
+**H100 Multi-GPU SUCCESS after fix:**
+- compile_time: 53.1s
+- generation_time: 10.4s (2x H100, 3 steps, 5 frames)
+- Video successfully exported
+
+**Blackwell (RTX PRO 6000) Multi-GPU SUCCESS after fix (2026-01-06):**
+- compile_time: 40.0s
+- generation_time: 12.3s (2x RTX PRO 6000, 3 steps, 5 frames)
+- Video successfully exported: `wan_output_*.mp4`
+- Fix applied to: `Multi-Sharding-MaxDiffusion/src/maxdiffusion/generate_wan.py:17`
+
 **Next steps:**
-1. **Try IOMMU/ACS configuration** - From Level1Techs forum, disabling IOMMU or using passthrough mode (`iommu=pt`) with ACS disabled in BIOS fixed similar issues for RTX PRO 6000 Blackwell users
-2. **File JAX GitHub issue** with detailed reproduction steps (link to existing #30786, #33910)
-3. **Upgrade GPU driver** to >= 580 for CUDA 13 support (requires admin access)
-4. **Test on Rice cluster L40S nodes** (older architecture, should work)
-5. **Monitor releases:**
-   - JAX updates for Blackwell fixes
-   - NVIDIA JAX container (currently has best Blackwell support)
-   - NCCL 2.29 (Q4 2025 roadmap mentions Blackwell optimizations)
+1. ✅ Apply fix to Blackwell (RTX PRO 6000) - DONE, VERIFIED WORKING
+2. Test with more GPUs (4, 8) on Blackwell
+3. Consider filing JAX issue about the race condition for permanent upstream fix
+4. Proceed to Phase 2: Parallelism Implementation (TP, SP, DistriFusion)
