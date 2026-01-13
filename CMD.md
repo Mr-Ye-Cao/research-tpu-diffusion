@@ -84,23 +84,43 @@ export NCCL_P2P_DISABLE=1
 export CUDA_VISIBLE_DEVICES=5,6,7
 ```
 
+## DiT (Wan2.1) Profiling Commands
+
+```bash
+# DiT distributed profiling (simulates TP/SP patterns)
+CUDA_VISIBLE_DEVICES=5,6,7 torchrun --nproc_per_node=3 profile_dit_distributed.py
+
+# DiT single GPU profiling (requires model download)
+CUDA_VISIBLE_DEVICES=5 python profile_dit_single_gpu.py
+```
+
 ## Key Results from This Session
 
-### Single GPU (GPU 5)
+### UNet (SD 1.5) - Single GPU
 - Mean inference time: 442.35 ms (20 steps)
 - Time per step: 22.12 ms
 
-### Distributed (GPUs 5,6,7)
+### UNet - Distributed (GPUs 5,6,7)
 - NCCL All-Reduce bandwidth: 42-126 Gbps
 - TP Simulation comm percentage: 46.9%
 - DistriFusion overlap potential: 1.88x speedup
 
+### DiT (Wan2.1) - Distributed (GPUs 5,6,7)
+- NCCL All-Reduce bandwidth: 138-198 Gbps (larger tensors)
+- TP Simulation comm percentage: 41.3%
+- SP Simulation comm percentage: 61.0%
+- DistriFusion TP overlap potential: 1.70x speedup
+- DistriFusion SP overlap potential: 2.57x speedup
+
 ## Results Files
 
 ```bash
-# View single GPU results
+# View UNet single GPU results
 cat ./profiling_results/single_gpu/20260113_061347/results.json
 
-# View distributed results
+# View UNet distributed results
 cat ./profiling_results/distributed/20260113_061620_gpus3/all_results.json
+
+# View DiT distributed results
+cat ./profiling_results/dit_distributed/20260113_063738_gpus3/all_results.json
 ```
