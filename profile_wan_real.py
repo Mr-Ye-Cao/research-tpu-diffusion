@@ -1,87 +1,83 @@
 """
-Single GPU Profiling Script for Wan2.1 DiT Model
+Real Wan2.1 DiT Model Profiling Script
 
-This script profiles the Wan2.1 1.3B DiT (Diffusion Transformer) model
-on a single GPU to establish baseline compute times.
-
-Wan2.1 uses DiT architecture (transformer-based) instead of UNet.
-Key differences from UNet:
-- More attention operations
-- Less convolution operations
-- Different communication patterns for parallelism
+This script profiles the actual Wan2.1-T2V-1.3B model on a single GPU
+to measure compute operation breakdown.
 
 Usage:
-    CUDA_VISIBLE_DEVICES=5 python profile_dit_single_gpu.py
+    cd /home/ye/workspace/tpu/research-tpu-diffusion
+    CUDA_VISIBLE_DEVICES=5 python profile_wan_real.py
 """
 
+import os
+import sys
+import json
 import torch
 import torch.profiler
-from diffusers import CogVideoXPipeline
-from diffusers.utils import export_to_video
-import os
-import json
 from datetime import datetime
 
-# Configuration
-# CogVideoX-2b: DiT-based video model, 2B params, diffusers format
-MODEL_ID = "THUDM/CogVideoX-2b"
-PROMPT = "A cat walking on the grass"
-NUM_INFERENCE_STEPS = 20
-NUM_WARMUP_RUNS = 1
-NUM_PROFILE_RUNS = 3
-OUTPUT_DIR = "./profiling_results/dit_single_gpu"
+# Add Wan2.1 repo to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'Wan2.1'))
 
-# Video generation params (smaller for faster profiling)
-NUM_FRAMES = 9  # CogVideoX generates 49 frames by default, use fewer for profiling
-HEIGHT = 480
-WIDTH = 720
+import wan
+from wan.configs import WAN_CONFIGS, SIZE_CONFIGS
+
+# Configuration
+CKPT_DIR = "./Wan2.1-T2V-1.3B"
+TASK = "t2v-1.3B"
+PROMPT = "A cat walking on the grass"
+SIZE = "480*832"  # Smaller for faster profiling (width*height)
+FRAME_NUM = 17    # Smaller for faster profiling (4n+1)
+SAMPLE_STEPS = 10  # Fewer steps for profiling
+OUTPUT_DIR = "./profiling_results/wan_real"
+
+NUM_WARMUP_RUNS = 1
+NUM_PROFILE_RUNS = 2
+
 
 def setup_model(device):
-    """Load and configure the CogVideoX DiT model."""
-    print(f"Loading model {MODEL_ID}...")
-    print("This may take a few minutes for first download...")
+    """Load Wan2.1 model."""
+    print(f"Loading Wan2.1 model from {CKPT_DIR}...")
+    print(f"Task: {TASK}")
 
-    pipe = CogVideoXPipeline.from_pretrained(
-        MODEL_ID,
-        torch_dtype=torch.float16,
+    cfg = WAN_CONFIGS[TASK]
+
+    # Load the Wan pipeline
+    model = wan.WanT2V(
+        config=cfg,
+        checkpoint_dir=CKPT_DIR,
+        device_id=0,
+        rank=0,
+        t5_fsdp=False,
+        dit_fsdp=False,
+        use_usp=False,
+        t5_cpu=False,
     )
-    pipe.enable_model_cpu_offload()  # Use CPU offload if not enough VRAM
 
-    return pipe
+    print("Model loaded successfully!")
+    return model
 
-def setup_model_full_gpu(device):
-    """Load model fully on GPU (needs ~20GB+ VRAM)."""
-    print(f"Loading model {MODEL_ID} (full GPU mode)...")
 
-    pipe = CogVideoXPipeline.from_pretrained(
-        MODEL_ID,
-        torch_dtype=torch.float16,
-    )
-    pipe = pipe.to(device)
-
-    # Enable memory efficient attention
-    pipe.enable_attention_slicing()
-
-    return pipe
-
-def warmup(pipe, prompt, num_runs=1):
-    """Warmup runs to stabilize CUDA kernels."""
+def warmup(model, num_runs=1):
+    """Warmup runs."""
     print(f"Running {num_runs} warmup iterations...")
+    size_tuple = SIZE_CONFIGS[SIZE]  # e.g., (480, 832) for "480*832"
     for i in range(num_runs):
         with torch.no_grad():
-            _ = pipe(
-                prompt=prompt,
-                num_inference_steps=NUM_INFERENCE_STEPS,
-                num_frames=NUM_FRAMES,
-                height=HEIGHT,
-                width=WIDTH,
-                output_type="latent",
+            _ = model.generate(
+                input_prompt=PROMPT,
+                size=size_tuple,
+                frame_num=FRAME_NUM,
+                sampling_steps=SAMPLE_STEPS,
+                seed=42,
+                offload_model=False,  # Keep on GPU for consistent profiling
             )
         torch.cuda.synchronize()
     print("Warmup complete.")
 
-def profile_inference(pipe, prompt, output_dir):
-    """Profile the DiT inference with torch.profiler."""
+
+def profile_inference(model, output_dir):
+    """Profile Wan2.1 inference."""
     os.makedirs(output_dir, exist_ok=True)
 
     schedule = torch.profiler.schedule(
@@ -92,13 +88,12 @@ def profile_inference(pipe, prompt, output_dir):
     )
 
     results = {
-        "model": MODEL_ID,
+        "model": "Wan2.1-T2V-1.3B",
         "architecture": "DiT (Diffusion Transformer)",
-        "device": str(pipe.device) if hasattr(pipe, 'device') else "cuda",
-        "num_inference_steps": NUM_INFERENCE_STEPS,
-        "num_frames": NUM_FRAMES,
-        "height": HEIGHT,
-        "width": WIDTH,
+        "task": TASK,
+        "size": SIZE,
+        "frame_num": FRAME_NUM,
+        "sample_steps": SAMPLE_STEPS,
         "runs": []
     }
 
@@ -125,13 +120,13 @@ def profile_inference(pipe, prompt, output_dir):
             start_event.record()
 
             with torch.no_grad():
-                _ = pipe(
-                    prompt=prompt,
-                    num_inference_steps=NUM_INFERENCE_STEPS,
-                    num_frames=NUM_FRAMES,
-                    height=HEIGHT,
-                    width=WIDTH,
-                    output_type="latent",
+                video = model.generate(
+                    input_prompt=PROMPT,
+                    size=SIZE_CONFIGS[SIZE],
+                    frame_num=FRAME_NUM,
+                    sampling_steps=SAMPLE_STEPS,
+                    seed=42 + run_idx,
+                    offload_model=False,
                 )
 
             end_event.record()
@@ -143,9 +138,9 @@ def profile_inference(pipe, prompt, output_dir):
                 results["runs"].append({
                     "run_index": run_idx,
                     "total_time_ms": elapsed_time,
-                    "time_per_step_ms": elapsed_time / NUM_INFERENCE_STEPS,
+                    "time_per_step_ms": elapsed_time / SAMPLE_STEPS,
                 })
-                print(f"  Run {run_idx}: {elapsed_time:.2f} ms ({elapsed_time/NUM_INFERENCE_STEPS:.2f} ms/step)")
+                print(f"  Run {run_idx}: {elapsed_time:.2f} ms ({elapsed_time/SAMPLE_STEPS:.2f} ms/step)")
 
             prof.step()
 
@@ -155,7 +150,7 @@ def profile_inference(pipe, prompt, output_dir):
         "mean_time_ms": sum(times) / len(times),
         "min_time_ms": min(times),
         "max_time_ms": max(times),
-        "mean_time_per_step_ms": sum(times) / len(times) / NUM_INFERENCE_STEPS,
+        "mean_time_per_step_ms": sum(times) / len(times) / SAMPLE_STEPS,
     }
 
     # Save results
@@ -164,17 +159,15 @@ def profile_inference(pipe, prompt, output_dir):
         json.dump(results, f, indent=2)
 
     print(f"\nResults saved to {results_file}")
-    print(f"TensorBoard traces saved to {output_dir}")
-
     return prof, results
 
+
 def analyze_profile(prof):
-    """Analyze and print profiler results."""
+    """Analyze profiler results."""
     print("\n" + "="*80)
-    print("PROFILER ANALYSIS - DiT (Diffusion Transformer)")
+    print("PROFILER ANALYSIS - Wan2.1 DiT")
     print("="*80)
 
-    # Key averages by CUDA time
     print("\nTop 20 operations by CUDA time:")
     print(prof.key_averages().table(
         sort_by="self_device_time_total",
@@ -183,16 +176,17 @@ def analyze_profile(prof):
 
     return prof.key_averages()
 
+
 def categorize_dit_operations(key_averages):
-    """Categorize DiT operations into compute vs other categories."""
+    """Categorize DiT operations."""
     categories = {
-        "attention": [],      # Self-attention, cross-attention
-        "linear_ffn": [],     # Linear layers, FFN
-        "normalization": [],  # LayerNorm, RMSNorm
-        "activation": [],     # GELU, SiLU, etc.
-        "embedding": [],      # Embeddings, positional encoding
-        "memory_ops": [],     # Copy, transpose, etc.
-        "conv": [],           # Any conv operations (VAE)
+        "attention": [],
+        "linear_ffn": [],
+        "normalization": [],
+        "activation": [],
+        "embedding": [],
+        "memory_ops": [],
+        "conv": [],
         "other": [],
     }
 
@@ -218,7 +212,7 @@ def categorize_dit_operations(key_averages):
             categories["other"].append((item.key, cuda_time))
 
     print("\n" + "="*80)
-    print("DiT OPERATION CATEGORIES (by CUDA time)")
+    print("Wan2.1 DiT OPERATION CATEGORIES")
     print("="*80)
 
     total_time = sum(item.self_device_time_total for item in key_averages)
@@ -229,14 +223,13 @@ def categorize_dit_operations(key_averages):
         pct = (cat_time / total_time * 100) if total_time > 0 else 0
         breakdown[cat_name] = {"time_ms": cat_time/1000, "percentage": pct}
         print(f"\n{cat_name}: {cat_time/1000:.2f} ms ({pct:.1f}%)")
-        # Show top 3 ops in each category
         for op, t in sorted(ops, key=lambda x: -x[1])[:3]:
             print(f"  - {op[:80]}: {t/1000:.2f} ms")
 
     return categories, breakdown
 
+
 def main():
-    # Check CUDA availability
     if not torch.cuda.is_available():
         print("ERROR: CUDA is not available!")
         return
@@ -247,22 +240,23 @@ def main():
     print(f"PyTorch version: {torch.__version__}")
     print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
 
-    # Setup - try full GPU first, fall back to CPU offload
+    # Check flash_attn availability
     try:
-        pipe = setup_model_full_gpu(device)
-        print("Model loaded fully on GPU")
-    except torch.cuda.OutOfMemoryError:
-        print("Not enough VRAM, using CPU offload...")
-        torch.cuda.empty_cache()
-        pipe = setup_model(device)
+        import flash_attn
+        print(f"Flash Attention: Available (v{flash_attn.__version__})")
+    except ImportError:
+        print("Flash Attention: Not available (using SDPA fallback)")
+
+    # Setup model
+    model = setup_model(device)
 
     # Warmup
-    warmup(pipe, PROMPT, NUM_WARMUP_RUNS)
+    warmup(model, NUM_WARMUP_RUNS)
 
     # Profile
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = f"{OUTPUT_DIR}/{timestamp}"
-    prof, results = profile_inference(pipe, PROMPT, output_dir)
+    prof, results = profile_inference(model, output_dir)
 
     # Analyze
     key_averages = analyze_profile(prof)
@@ -276,24 +270,23 @@ def main():
 
     # Summary
     print("\n" + "="*80)
-    print("SUMMARY - Wan2.1 DiT Model")
+    print("SUMMARY - Wan2.1 DiT Model (REAL)")
     print("="*80)
-    print(f"Model: {MODEL_ID}")
-    print(f"Architecture: DiT (Diffusion Transformer)")
-    print(f"Video: {NUM_FRAMES} frames @ {WIDTH}x{HEIGHT}")
-    print(f"Inference steps: {NUM_INFERENCE_STEPS}")
+    print(f"Model: Wan2.1-T2V-1.3B")
+    print(f"Video: {FRAME_NUM} frames @ {SIZE}")
+    print(f"Inference steps: {SAMPLE_STEPS}")
     print(f"Mean inference time: {results['statistics']['mean_time_ms']:.2f} ms")
     print(f"Mean time per step: {results['statistics']['mean_time_per_step_ms']:.2f} ms")
 
-    # DiT-specific analysis
     attention_pct = breakdown.get("attention", {}).get("percentage", 0)
     linear_pct = breakdown.get("linear_ffn", {}).get("percentage", 0)
     print(f"\nDiT Compute Profile:")
     print(f"  Attention: {attention_pct:.1f}%")
     print(f"  Linear/FFN: {linear_pct:.1f}%")
-    print(f"  (Attention+Linear = {attention_pct + linear_pct:.1f}% - these benefit from TP)")
+    print(f"  (Attention+Linear = {attention_pct + linear_pct:.1f}%)")
 
     print(f"\nTo view traces: tensorboard --logdir {output_dir}")
+
 
 if __name__ == "__main__":
     main()

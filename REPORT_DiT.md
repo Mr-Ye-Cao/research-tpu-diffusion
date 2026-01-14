@@ -10,7 +10,7 @@
 
 ## Executive Summary
 
-We profiled **Wan2.1 DiT (Diffusion Transformer)** communication patterns to measure comm/compute breakdown for the auto-sharding cost model.
+We profiled **Wan2.1 DiT (Diffusion Transformer) 1.3B** using the **real model** to measure compute operation breakdown and communication patterns for the auto-sharding cost model.
 
 ### Key Findings
 
@@ -23,7 +23,51 @@ DistriFusion's activation reuse can hide communication latency by overlapping cu
 
 ---
 
-## 1. Why DiT (Not UNet)?
+## 1. Real Wan2.1 Profiling Results (NEW)
+
+### Single GPU Baseline
+
+We ran the **actual Wan2.1-T2V-1.3B model** on a single GPU with SDPA (Scaled Dot Product Attention):
+
+| Parameter | Value |
+|-----------|-------|
+| Model | Wan2.1-T2V-1.3B |
+| Video Size | 480x832 |
+| Frame Count | 17 frames |
+| Inference Steps | 10 |
+| Attention Backend | PyTorch SDPA (native) |
+
+**Performance:**
+- **Mean inference time:** 4,587.62 ms (10 steps)
+- **Time per step:** 458.76 ms
+
+### Compute Operation Breakdown (Real)
+
+| Category | Time (ms) | Percentage |
+|----------|-----------|------------|
+| **Linear/FFN** | 8,011.64 | **27.7%** |
+| **Attention** | 2,900.54 | **10.0%** |
+| Memory Operations | 2,705.85 | 9.3% |
+| Convolutions (VAE) | 1,101.67 | 3.8% |
+| Activation (GELU/SiLU) | 518.25 | 1.8% |
+| Normalization | 252.19 | 0.9% |
+| Other (profiler overhead) | 13,454.24 | 46.5% |
+
+**Key Insight:** Attention + Linear/FFN = **37.7%** of compute - these are the main targets for Tensor Parallelism.
+
+### Top Operations by CUDA Time
+
+| Operation | CUDA Time | Notes |
+|-----------|-----------|-------|
+| aten::addmm (Linear) | 2,075 ms | Main FFN operations |
+| flash_attention_forward | 1,424 ms | Self-attention |
+| cudnn_convolution | 933 ms | VAE encoder/decoder |
+| aten::mul | 829 ms | Element-wise scaling |
+| aten::cat | 580 ms | Tensor concatenation |
+
+---
+
+## 2. Why DiT (Not UNet)?
 
 ### Architecture Comparison
 

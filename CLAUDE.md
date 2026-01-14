@@ -91,19 +91,50 @@ This is significant because:
 - **Hardware**: 8x NVIDIA RTX PRO 6000 Blackwell (96GB VRAM each)
 - **Available GPUs for profiling**: 5, 6, 7 (others in use)
 
+### Real Wan2.1 DiT Profiling (NEW)
+
+Profiled the **actual Wan2.1-T2V-1.3B model** using PyTorch SDPA:
+
+| Parameter | Value |
+|-----------|-------|
+| Model | Wan2.1-T2V-1.3B |
+| Video Size | 480x832 |
+| Frame Count | 17 frames |
+| Inference Steps | 10 |
+
+**Performance:**
+- **Mean inference time**: 4,587.62 ms
+- **Time per step**: 458.76 ms
+
+**Compute Breakdown:**
+| Category | Percentage |
+|----------|------------|
+| Linear/FFN | 27.7% |
+| Attention | 10.0% |
+| Memory Ops | 9.3% |
+| Conv (VAE) | 3.8% |
+| Activation | 1.8% |
+| Normalization | 0.9% |
+
+**Key Finding**: Attention + Linear/FFN = **37.7%** - main targets for Tensor Parallelism.
+
 ## Results Location
-- **Single GPU**: `./profiling_results/single_gpu/20260113_061347/`
-- **Distributed**: `./profiling_results/distributed/20260113_061620_gpus3/`
+- **UNet Single GPU**: `./profiling_results/single_gpu/20260113_061347/`
+- **UNet Distributed**: `./profiling_results/distributed/20260113_061620_gpus3/`
+- **DiT Distributed (simulated)**: `./profiling_results/dit_distributed/20260113_063738_gpus3/`
+- **Real Wan2.1**: `./profiling_results/wan_real/20260113_071418/`
 
 ## Progress Log
 
 ### 2026-01-13: Session Complete
 - [x] Environment setup and verification
 - [x] Created profiling scripts
-- [x] Ran single GPU baseline profiling
-- [x] Ran 3-GPU distributed profiling
+- [x] Ran single GPU baseline profiling (UNet SD 1.5)
+- [x] Ran 3-GPU distributed profiling (UNet)
+- [x] Simulated DiT communication patterns
+- [x] **Ran real Wan2.1-T2V-1.3B model profiling**
 - [x] Analyzed comm vs compute breakdown
-- [x] Quantified DistriFusion overlap potential (1.88x speedup)
+- [x] Quantified DistriFusion overlap potential (1.88x UNet, 1.70x DiT)
 
 ## Implications for Auto-Sharding
 

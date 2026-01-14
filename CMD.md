@@ -90,8 +90,26 @@ export CUDA_VISIBLE_DEVICES=5,6,7
 # DiT distributed profiling (simulates TP/SP patterns)
 CUDA_VISIBLE_DEVICES=5,6,7 torchrun --nproc_per_node=3 profile_dit_distributed.py
 
-# DiT single GPU profiling (requires model download)
+# DiT single GPU profiling (CogVideoX - requires download)
 CUDA_VISIBLE_DEVICES=5 python profile_dit_single_gpu.py
+
+# Real Wan2.1-T2V-1.3B profiling (uses actual model)
+CUDA_VISIBLE_DEVICES=5 python profile_wan_real.py
+```
+
+## Wan2.1 Model Setup
+
+```bash
+# Clone Wan2.1 repo
+git clone https://github.com/Wan-Video/Wan2.1.git
+
+# Download model (huggingface-cli)
+huggingface-cli download Wan-AI/Wan2.1-T2V-1.3B --local-dir ./Wan2.1-T2V-1.3B
+
+# Patch model to use SDPA instead of flash_attn (if flash_attn not installed)
+# Edit Wan2.1/wan/modules/model.py line 10:
+# Change: from .attention import flash_attention
+# To:     from .attention import attention as flash_attention
 ```
 
 ## Key Results from This Session
@@ -105,12 +123,21 @@ CUDA_VISIBLE_DEVICES=5 python profile_dit_single_gpu.py
 - TP Simulation comm percentage: 46.9%
 - DistriFusion overlap potential: 1.88x speedup
 
-### DiT (Wan2.1) - Distributed (GPUs 5,6,7)
+### DiT (Wan2.1) - Distributed (GPUs 5,6,7) - Simulated
 - NCCL All-Reduce bandwidth: 138-198 Gbps (larger tensors)
 - TP Simulation comm percentage: 41.3%
 - SP Simulation comm percentage: 61.0%
 - DistriFusion TP overlap potential: 1.70x speedup
 - DistriFusion SP overlap potential: 2.57x speedup
+
+### Real Wan2.1-T2V-1.3B - Single GPU (GPU 5)
+- Video: 17 frames @ 480x832
+- Inference steps: 10
+- Mean inference time: 4,587.62 ms
+- Time per step: 458.76 ms
+- Attention compute: 10.0%
+- Linear/FFN compute: 27.7%
+- Attention+Linear: 37.7% (TP-parallelizable)
 
 ## Results Files
 
@@ -121,6 +148,9 @@ cat ./profiling_results/single_gpu/20260113_061347/results.json
 # View UNet distributed results
 cat ./profiling_results/distributed/20260113_061620_gpus3/all_results.json
 
-# View DiT distributed results
+# View DiT distributed results (simulated)
 cat ./profiling_results/dit_distributed/20260113_063738_gpus3/all_results.json
+
+# View real Wan2.1 results
+cat ./profiling_results/wan_real/20260113_071418/results.json
 ```
