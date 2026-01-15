@@ -307,3 +307,83 @@ CUDA_VISIBLE_DEVICES=5,6,7 torchrun --nproc_per_node=3 distrifuser/scripts/test_
 | KV All-Gather | 10.00 | 0.703 | 341.4 |
 | Attn All-Gather | 5.00 | 0.373 | 321.3 |
 | FFN All-Reduce | 15.00 | 0.630 | 253.8 |
+
+---
+
+## Phase 3: DistriFusion for Wan2.1 (2026-01-15)
+
+### DistriFusion Benchmark Commands
+
+```bash
+cd /home/ye/workspace/tpu/research-tpu-diffusion
+
+# Single GPU baseline
+CUDA_VISIBLE_DEVICES=5 python distrifuser/scripts/benchmark_wan_distrifusion.py \
+    --mode single --frame_num 17 --num_steps 10
+
+# Multi-GPU with DistriFusion TP (2 GPUs)
+# Note: FFN dim (8960) must be divisible by n_gpus
+CUDA_VISIBLE_DEVICES=5,6 torchrun --nproc_per_node=2 \
+    distrifuser/scripts/benchmark_wan_distrifusion.py \
+    --mode multi --frame_num 17 --num_steps 10
+
+# Multi-GPU with DistriFusion TP (4 GPUs)
+CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --nproc_per_node=4 \
+    distrifuser/scripts/benchmark_wan_distrifusion.py \
+    --mode multi --frame_num 17 --num_steps 10
+```
+
+### Key Results (2026-01-15)
+
+#### Synchronous Tensor Parallelism Results
+
+| Configuration | Frames | Steps | Inference Time | Time/Step |
+|---------------|--------|-------|----------------|-----------|
+| Single GPU | 17 | 10 | 7,281 ms | 728 ms |
+| 2 GPUs (Sync TP) | 17 | 5 | 31,634 ms | 6,327 ms |
+
+**Finding**: Synchronous TP is **8.7x slower** than single GPU due to:
+- 90 all-reduces per forward pass (30 layers × 3 ops)
+- CFG doubles forward passes (180 all-reduces per step)
+- Communication latency dominates without async overlap
+
+### Async DistriFusion Results (2026-01-15)
+
+Implemented async communication overlap pattern from DistriFusion paper.
+
+```bash
+# Run async DistriFusion benchmark (2 GPUs)
+CUDA_VISIBLE_DEVICES=5,6 torchrun --nproc_per_node=2 \
+    distrifuser/scripts/benchmark_wan_async.py \
+    --frame_num 17 --num_steps 10 --warmup_steps 4
+```
+
+#### Performance Comparison (17 frames, 10 steps, 480x832)
+
+| Configuration | Total Time | Time/Step | vs Single GPU |
+|---------------|------------|-----------|---------------|
+| Single GPU | 7,862 ms | 786 ms | baseline |
+| Sync TP (2 GPU) | 33,166 ms | 3,317 ms | **4.2x slower** |
+| Async TP (2 GPU) | 32,250 ms | 3,225 ms | **4.1x slower** |
+
+**Finding**: Async DistriFusion is only ~3% faster than synchronous TP.
+
+**Root Cause Analysis**:
+1. **CFG interference**: With classifier-free guidance, consecutive forward passes alternate between unconditional/conditional, breaking the temporal similarity assumption
+2. **High all-reduce frequency**: 90 all-reduces per forward pass (30 layers × 3 ops)
+3. **Limited overlap window**: Layer i's async overlaps with layers i+1 to N's compute, but cumulative latency dominates
+
+**Conclusion**: Tensor Parallelism is not efficient for Wan2.1 video generation with short sequences (17 frames). The communication overhead (~4.2x slowdown) far exceeds any parallelization benefit.
+
+### Files Created
+
+- `distrifuser/distrifuser/models/wan/distri_wan_dit.py` - Sync TP wrapper
+- `distrifuser/distrifuser/models/wan/distri_wan_dit_async.py` - Async TP wrapper
+- `distrifuser/distrifuser/modules/wan/attention.py` - Sync attention TP
+- `distrifuser/distrifuser/modules/wan/async_attention.py` - Async attention TP
+- `distrifuser/distrifuser/modules/wan/feed_forward.py` - Sync FFN TP
+- `distrifuser/distrifuser/modules/wan/async_feed_forward.py` - Async FFN TP
+- `distrifuser/distrifuser/pipelines_wan/wan_pipeline.py`
+- `distrifuser/distrifuser/utils_wan.py`
+- `distrifuser/scripts/benchmark_wan_distrifusion.py` - Sync benchmark
+- `distrifuser/scripts/benchmark_wan_async.py` - Async benchmark

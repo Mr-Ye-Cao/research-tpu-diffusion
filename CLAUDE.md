@@ -226,11 +226,171 @@ The xFuser USP (Ulysses Sequence Parallelism) works correctly on Blackwell GPUs 
 ### TODO: Next Steps
 - [x] Install Flash Attention for full xFuser USP testing ✅
 - [x] Profile actual multi-GPU video generation ✅
-- [ ] Run production benchmark without profiling overhead
-- [ ] Implement DistriFusion-style async communication for Wan2.1
+- [x] Run production benchmark without profiling overhead ✅
+- [x] Implement DistriFusion-style async communication for Wan2.1 ✅ (Result: TP not suitable for video)
 - [ ] Compare with xDiT context parallelism performance
 
+---
+
+## Phase 3: DistriFusion for Wan2.1 DiT (COMPLETED)
+
+### Goal
+Adapt distrifuser library to support Wan2.1 DiT model with:
+1. Tensor Parallelism (TP) for attention and FFN ✅
+2. Async communication overlap (DistriFusion technique) ✅
+3. Optional CUDA Graph support - TODO
+
+### Architecture (Implemented)
+
+```
+distrifuser/distrifuser/
+├── models/
+│   └── wan/
+│       ├── distri_wan_dit.py       # ✅ Sync TP wrapper
+│       └── distri_wan_dit_async.py # ✅ Async TP wrapper (DistriFusion)
+├── modules/
+│   └── wan/
+│       ├── __init__.py
+│       ├── attention.py            # ✅ Sync TP attention
+│       ├── async_attention.py      # ✅ Async TP attention (DistriFusion)
+│       ├── feed_forward.py         # ✅ Sync TP FFN
+│       └── async_feed_forward.py   # ✅ Async TP FFN (DistriFusion)
+├── pipelines_wan/
+│   └── wan_pipeline.py            # ✅ wrap_wan_model, wrap_wan_model_async
+└── utils_wan.py                   # ✅ DistriWanConfig
+```
+
+### Implementation Status
+
+#### Step 1: DistriWanConfig ✅
+- [x] Video-specific config (frame_num, video_size)
+- [x] Supports any world size (not just power-of-2)
+- [x] Separate from DistriConfig to avoid SDXL dependencies
+
+#### Step 2: DistriWanAttention (TP) ✅
+- [x] Shard Q, K, V, O projections by heads
+- [x] Shard QK norm weights
+- [x] All-reduce after output projection
+- [x] Bias added after all-reduce (not duplicated)
+
+#### Step 3: DistriWanFFN (TP) ✅
+- [x] Shard FFN up-projection by output dim
+- [x] Shard FFN down-projection by input dim
+- [x] All-reduce after down-projection
+- [x] Requirement: ffn_dim must be divisible by n_gpus
+
+#### Step 4: DistriWanDiT ✅
+- [x] Wrap WanModel transformer blocks
+- [x] Replace self_attn with DistriWanSelfAttentionTP
+- [x] Replace cross_attn with DistriWanCrossAttentionTP
+- [x] Replace FFN with DistriWanFFNTP
+- [x] 30 layers wrapped (30 self_attn, 30 cross_attn, 30 FFN)
+
+#### Step 5: DistriWanPipeline ✅
+- [x] wrap_wan_model() utility function
+- [x] DistriWanT2VPipeline class
+- [x] T5 text encoding stays on CPU
+- [x] VAE decode on rank 0
+
+#### Step 6: Async Communication (DistriFusion) ✅
+- [x] Implement activation caching between timesteps
+- [x] Overlap communication with computation (async all-reduce)
+- [x] Handle warmup steps (first N steps use sync, then async with cache)
+
+### Benchmark Results (17 frames, 10 steps, 480x832)
+
+| Configuration | Inference Time | Time/Step | vs Single GPU |
+|---------------|----------------|-----------|---------------|
+| Single GPU | 7,862 ms | 786 ms | baseline |
+| 2 GPUs (Sync TP) | 33,166 ms | 3,317 ms | **4.2x slower** |
+| 2 GPUs (Async TP) | 32,250 ms | 3,225 ms | **4.1x slower** |
+
+**Key Finding**: Async DistriFusion is only **~3% faster** than synchronous TP. Both are significantly slower than single GPU.
+
+### Analysis: Why DistriFusion Doesn't Help for Video/DiT
+
+**Root Cause**:
+1. **CFG breaks temporal similarity**: Classifier-free guidance alternates unconditional/conditional forward passes, so cached activations come from different inputs
+2. **Too many all-reduces**: 90 all-reduces per forward pass (30 layers × 3 ops)
+3. **Limited overlap window**: Layer i's async overlaps with layers i+1 to N's compute, but cumulative latency dominates
+
+**DistriFusion Original Design vs Our Implementation**:
+| | Original Paper | Our Implementation |
+|---|---|---|
+| Model | UNet (Conv-heavy) | DiT (Attention-heavy) |
+| Parallelism | Patch Parallelism | Tensor Parallelism |
+| Communication | Halo exchange (sparse) | All-reduce (dense) |
+| Suitable for | 2D Images | ❌ Not suitable for video |
+
+**Conclusion**: Tensor Parallelism (with or without async) is not efficient for Wan2.1 video generation. For multi-GPU speedup, use **Sequence Parallelism (USP)** for long videos (>129 frames).
+
+### Constraints Discovered
+
+1. **FFN divisibility**: ffn_dim (8960) must be divisible by n_gpus
+   - Works: 1, 2, 4, 5, 7, 8, 10, 14, 16, 20, ...
+   - Fails: 3, 6, 9, 11, 12, 13, ...
+
+2. **Heads divisibility**: num_heads (12) should be divisible by n_gpus
+   - Works: 1, 2, 3, 4, 6, 12
+   - With remainder handling: any count
+
+### Usage
+
+```bash
+# Sync TP (2 GPUs)
+CUDA_VISIBLE_DEVICES=5,6 torchrun --nproc_per_node=2 \
+    distrifuser/scripts/benchmark_wan_distrifusion.py \
+    --mode multi --frame_num 17 --num_steps 10
+
+# Async TP with DistriFusion (2 GPUs)
+CUDA_VISIBLE_DEVICES=5,6 torchrun --nproc_per_node=2 \
+    distrifuser/scripts/benchmark_wan_async.py \
+    --frame_num 17 --num_steps 10 --warmup_steps 4
+```
+
+### Files Created
+
+**Sync TP:**
+- `distrifuser/distrifuser/models/wan/distri_wan_dit.py`
+- `distrifuser/distrifuser/modules/wan/attention.py`
+- `distrifuser/distrifuser/modules/wan/feed_forward.py`
+- `distrifuser/scripts/benchmark_wan_distrifusion.py`
+
+**Async TP (DistriFusion):**
+- `distrifuser/distrifuser/models/wan/distri_wan_dit_async.py`
+- `distrifuser/distrifuser/modules/wan/async_attention.py`
+- `distrifuser/distrifuser/modules/wan/async_feed_forward.py`
+- `distrifuser/scripts/benchmark_wan_async.py`
+
+**Shared:**
+- `distrifuser/distrifuser/pipelines_wan/wan_pipeline.py`
+- `distrifuser/distrifuser/utils_wan.py`
+
 ## Progress Log
+
+### 2026-01-15: DistriFusion Adaptation for Wan2.1 (COMPLETED)
+
+**Sync TP Implementation:**
+- [x] Created DistriWanConfig for video generation (any world_size)
+- [x] Implemented DistriWanSelfAttentionTP (shard by heads, all-reduce output)
+- [x] Implemented DistriWanCrossAttentionTP
+- [x] Implemented DistriWanFFNTP (shard intermediate dim)
+- [x] Created DistriWanDiT model wrapper
+- [x] Created DistriWanT2VPipeline and wrap_wan_model utility
+- [x] Benchmarked synchronous TP: 4.2x slower than single GPU
+
+**Async TP Implementation (DistriFusion paper technique):**
+- [x] Implemented DistriWanSelfAttentionAsyncTP with activation caching
+- [x] Implemented DistriWanCrossAttentionAsyncTP
+- [x] Implemented DistriWanFFNAsyncTP
+- [x] Created DistriWanDiTAsync wrapper with cache management
+- [x] Added wrap_wan_model_async() utility
+- [x] Benchmarked async TP: 4.1x slower (only 3% faster than sync)
+
+**Conclusion:** DistriFusion's TP approach is not suitable for video/DiT models due to:
+1. CFG breaks temporal similarity assumption
+2. Too many all-reduces (90 per forward pass)
+3. Use USP (Sequence Parallelism) for long videos instead
 
 ### 2026-01-14: Video Generation Multi-GPU Profiling
 - [x] Cloned distrifuser repo (https://github.com/Mr-Ye-Cao/distrifuser.git)

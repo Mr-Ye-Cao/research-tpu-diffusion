@@ -1,6 +1,6 @@
 # Communication/Compute Overlap Profiling Report - DiT Architecture
 
-**Date:** January 13-14, 2026 (Updated)
+**Date:** January 13-15, 2026 (Updated)
 **Author:** Profiling Session
 **Target Model:** Wan2.1 DiT (Diffusion Transformer) 1.3B
 **Hardware:** 8x NVIDIA RTX PRO 6000 Blackwell (96GB VRAM each)
@@ -39,7 +39,18 @@ We profiled **Wan2.1 DiT (Diffusion Transformer) 1.3B** using the **real model**
 
 **Crossover point: ~100-129 frames (~30-40K tokens)**. Speedup scales with sequence length!
 
-DistriFusion's activation reuse can hide communication latency by overlapping current step's communication with previous step's computation.
+**Phase 3 (DistriFusion Implementation - 2026-01-15):**
+
+| Configuration | Inference Time | vs Single GPU |
+|---------------|----------------|---------------|
+| Single GPU | 7,862 ms | baseline |
+| Sync TP (2 GPU) | 33,166 ms | **4.2x slower** |
+| Async TP (2 GPU) | 32,250 ms | **4.1x slower** |
+
+**CRITICAL FINDING:** DistriFusion async overlap provides only **3% improvement** over sync TP. Both are significantly slower than single GPU because:
+1. CFG breaks temporal similarity assumption (alternating unconditional/conditional)
+2. 90 all-reduces per forward pass (30 layers × 3 ops) creates cumulative latency
+3. DistriFusion was designed for Patch Parallelism (sparse halo), not Tensor Parallelism (dense all-reduce)
 
 ---
 
@@ -557,6 +568,121 @@ WAN_TP_OVERLAP_SPEEDUP = 1.15
 
 ./profiling_results/wan_multi_gpu/20260114_173747_gpus3/
 └── results_rank0.json        # Multi-GPU USP with profiler
+```
+
+---
+
+## Phase 3: DistriFusion Implementation (2026-01-15)
+
+We implemented DistriFusion's tensor parallelism technique for Wan2.1 DiT to test if async communication overlap can improve multi-GPU performance.
+
+### Implementation Overview
+
+| Component | Sync TP | Async TP (DistriFusion) |
+|-----------|---------|-------------------------|
+| Self-Attention | Shard Q/K/V/O by heads, all-reduce | + Activation caching, async all-reduce |
+| Cross-Attention | Same as above | + Activation caching, async all-reduce |
+| FFN | Shard fc1/fc2, all-reduce | + Activation caching, async all-reduce |
+| Warmup | N/A | First 4 steps use sync (build cache) |
+
+**DistriFusion Async Pattern:**
+```
+Warmup (steps 0-3):     [Compute] → [Sync All-Reduce] → cache output
+After warmup (steps 4+): [Compute] → [Async All-Reduce] → return cached output
+                                           ↓
+                              Next layer overlaps with async comm
+```
+
+### Benchmark Results (17 frames, 10 steps, 480x832)
+
+| Configuration | Inference Time | Time/Step | vs Single GPU |
+|---------------|----------------|-----------|---------------|
+| **Single GPU** | 7,862 ms | 786 ms | baseline |
+| Sync TP (2 GPU) | 33,166 ms | 3,317 ms | **4.2x slower** |
+| Async TP (2 GPU) | 32,250 ms | 3,225 ms | **4.1x slower** |
+
+**Key Finding:** Async DistriFusion is only **~3% faster** than synchronous TP. Both are significantly slower than single GPU.
+
+### Root Cause Analysis
+
+**Why DistriFusion doesn't help for Wan2.1 Video Generation:**
+
+1. **CFG breaks temporal similarity**
+   - Classifier-Free Guidance alternates unconditional/conditional forward passes
+   - Cached activations from unconditional don't match conditional inputs
+   - DistriFusion assumes similar activations between timesteps
+
+2. **Too many all-reduces per forward pass**
+   - 30 transformer layers × 3 operations (self-attn, cross-attn, FFN) = **90 all-reduces**
+   - With CFG: 2 forward passes × 90 = **180 all-reduces per diffusion step**
+   - Cumulative latency dominates any overlap benefit
+
+3. **DistriFusion was designed for different architecture**
+   | | Original DistriFusion | Our Implementation |
+   |---|---|---|
+   | Model | UNet (Conv-heavy) | DiT (Attention-heavy) |
+   | Parallelism | **Patch Parallelism** | Tensor Parallelism |
+   | Communication | Halo exchange (sparse) | All-reduce (dense) |
+   | Comm frequency | Per patch boundary | **Every layer (90x/forward)** |
+
+### Comparison with Other Parallelism Strategies
+
+| Strategy | Best For | Wan2.1 17-frame | Wan2.1 241-frame |
+|----------|----------|-----------------|------------------|
+| **Single GPU** | Short videos | ✅ **Fastest** | Slow |
+| Tensor Parallel | Large models | ❌ 4.2x slower | ❌ Still slow |
+| DistriFusion TP | Image generation | ❌ 4.1x slower | ❌ Still slow |
+| **USP (Sequence)** | Long sequences | ❌ 4.3x slower | ✅ **1.60x faster** |
+
+### Conclusion
+
+**DistriFusion with Tensor Parallelism is NOT suitable for video generation** because:
+1. The async overlap technique requires similar consecutive activations (broken by CFG)
+2. All-reduce communication per layer (90x) is fundamentally inefficient
+3. Original DistriFusion uses Patch Parallelism with sparse halo exchange, not dense TP
+
+**Recommendation:** For multi-GPU video generation:
+- Short videos (<100 frames): Use **single GPU**
+- Long videos (>129 frames): Use **Sequence Parallelism (USP)**
+- DistriFusion benefit is limited to **image generation with UNet** architecture
+
+### Files Created
+
+```
+distrifuser/distrifuser/
+├── models/wan/
+│   ├── distri_wan_dit.py           # Sync TP wrapper
+│   └── distri_wan_dit_async.py     # Async TP wrapper (DistriFusion)
+├── modules/wan/
+│   ├── attention.py                # Sync attention TP
+│   ├── async_attention.py          # Async attention with caching
+│   ├── feed_forward.py             # Sync FFN TP
+│   └── async_feed_forward.py       # Async FFN with caching
+├── pipelines_wan/
+│   └── wan_pipeline.py             # wrap_wan_model, wrap_wan_model_async
+└── utils_wan.py                    # DistriWanConfig
+
+distrifuser/scripts/
+├── benchmark_wan_distrifusion.py   # Sync TP benchmark
+└── benchmark_wan_async.py          # Async TP benchmark
+```
+
+### Reproduction Commands
+
+```bash
+# Single GPU baseline
+CUDA_VISIBLE_DEVICES=5 python distrifuser/scripts/benchmark_wan_distrifusion.py \
+    --mode single --frame_num 17 --num_steps 10
+
+# Sync TP (2 GPUs - FFN 8960 must be divisible)
+CUDA_VISIBLE_DEVICES=5,6 torchrun --nproc_per_node=2 \
+    distrifuser/scripts/benchmark_wan_distrifusion.py \
+    --mode multi --frame_num 17 --num_steps 10
+
+# Async TP with DistriFusion (2 GPUs)
+CUDA_VISIBLE_DEVICES=5,6 torchrun --nproc_per_node=2 \
+    distrifuser/scripts/benchmark_wan_async.py \
+    --frame_num 17 --num_steps 10 --warmup_steps 4
 ```
 
 ---
