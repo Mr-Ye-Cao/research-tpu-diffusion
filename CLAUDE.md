@@ -123,8 +123,124 @@ Profiled the **actual Wan2.1-T2V-1.3B model** using PyTorch SDPA:
 - **UNet Distributed**: `./profiling_results/distributed/20260113_061620_gpus3/`
 - **DiT Distributed (simulated)**: `./profiling_results/dit_distributed/20260113_063738_gpus3/`
 - **Real Wan2.1**: `./profiling_results/wan_real/20260113_071418/`
+- **Wan2.1 Video Gen Single GPU**: `./profiling_results/wan_single_gpu/20260114_062914/`
+- **Wan2.1 NCCL Multi-GPU**: `./profiling_results/wan_nccl/20260114_064727_gpus3/`
+
+---
+
+## Phase 2: Video Generation Multi-GPU Profiling (NEW)
+
+### Goal
+Profile Wan2.1 video generation with DistriFusion-style parallelism to measure communication/compute overlap potential.
+
+### Distrifuser Repository Setup
+- **Repo**: `distrifuser/` (cloned from https://github.com/Mr-Ye-Cao/distrifuser.git)
+- **Branch**: `video-gen`
+- **Status**: UNet-based distrifuser works; adapting for DiT-based video models
+
+### Wan2.1 Single GPU Video Generation (NEW)
+
+| Parameter | Value |
+|-----------|-------|
+| Model | Wan2.1-T2V-1.3B |
+| Video Size | 480x832 |
+| Frame Count | 17 frames |
+| Inference Steps | 10 |
+
+**Performance:**
+- **Mean inference time**: 7,534.51 ms
+- **Time per step**: 753.45 ms
+
+### Wan2.1 Multi-GPU NCCL Communication Benchmark (3 GPUs)
+
+#### Communication Bandwidth (NVLink)
+| Operation | Tensor Shape | Size (MB) | Time (ms) | Bandwidth (Gbps) |
+|-----------|--------------|-----------|-----------|------------------|
+| KV All-Gather | [1, 1706, 2, 12, 128] | 10.00 | 0.703 | 341.4 |
+| Attn Output All-Gather | [1, 1706, 1536] | 5.00 | 0.373 | 321.3 |
+| FFN All-Reduce | [1, 5120, 1536] | 15.00 | 0.630 | 253.8 |
+
+#### Per-Layer Communication Overhead
+| Parallelism Strategy | Time per Layer (ms) | Total for 30 Layers (ms) |
+|---------------------|---------------------|--------------------------|
+| Sequence Parallel (USP) | 0.747 | 22.40 |
+| Tensor Parallel | 1.261 | 37.83 |
+
+#### DistriFusion Overlap Analysis
+
+**With 3 GPUs (Sequence Parallelism - USP):**
+- Communication time per step: 22.40 ms
+- Estimated compute time per step: 251.0 ms (753 ms / 3 GPUs)
+- **Communication percentage: 8.2%**
+- **Potential overlap speedup: 1.09x**
+
+**With 3 GPUs (Tensor Parallelism):**
+- Communication time per step: 37.83 ms
+- Estimated compute time per step: 251.0 ms
+- **Communication percentage: 13.1%**
+- **Potential overlap speedup: 1.15x**
+
+### Key Findings for Video Generation
+
+1. **High NVLink Bandwidth** (~320 Gbps)
+   - RTX PRO 6000 Blackwell GPUs have excellent intra-node connectivity
+   - Communication overhead is relatively low (8-13%)
+
+2. **Sequence Parallelism (USP) is More Efficient**
+   - Only 8.2% communication overhead vs 13.1% for tensor parallelism
+   - Better suited for long-sequence video generation
+
+3. **DistriFusion Overlap Benefit is Modest**
+   - 1.09-1.15x potential speedup (vs 1.88x for UNet on lower-bandwidth setup)
+   - Already low comm overhead means less room for improvement
+
+4. **Model Architecture Matters**
+   - DiT models have different comm patterns than UNet
+   - Self-attention requires all-gather of KV from all sequence chunks
+   - FFN can use tensor parallelism with all-reduce
+
+### Flash Attention on Blackwell (RESOLVED)
+
+**Problem**: Flash Attention didn't have official prebuilt wheels for Blackwell (sm_120).
+
+**Solution**: Build from source with CUDA 12.8:
+```bash
+# With ninja installed, build takes ~15 minutes
+pip install ninja
+TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0;10.0;12.0" pip install flash-attn --no-build-isolation
+```
+
+**Result**: Flash Attention 2.8.3 now works on RTX PRO 6000 Blackwell (sm_120).
+
+### Multi-GPU Video Generation with USP (NEW)
+
+| Configuration | Inference Time | Time/Step |
+|---------------|----------------|-----------|
+| Single GPU | 7,534 ms | 753 ms |
+| 3 GPUs (USP) | 31,341 ms* | 3,134 ms* |
+
+*Note: Multi-GPU time includes significant profiling overhead. Actual production performance would be faster.
+
+The xFuser USP (Ulysses Sequence Parallelism) works correctly on Blackwell GPUs with Flash Attention.
+
+### TODO: Next Steps
+- [x] Install Flash Attention for full xFuser USP testing ✅
+- [x] Profile actual multi-GPU video generation ✅
+- [ ] Run production benchmark without profiling overhead
+- [ ] Implement DistriFusion-style async communication for Wan2.1
+- [ ] Compare with xDiT context parallelism performance
 
 ## Progress Log
+
+### 2026-01-14: Video Generation Multi-GPU Profiling
+- [x] Cloned distrifuser repo (https://github.com/Mr-Ye-Cao/distrifuser.git)
+- [x] Created `video-gen` branch for Wan2.1 video generation work
+- [x] Explored distrifuser codebase (patch parallelism, tensor parallelism, async communication)
+- [x] Created `profile_wan_video.py` for single/multi-GPU Wan2.1 profiling
+- [x] Created `profile_wan_nccl.py` for NCCL communication benchmarking
+- [x] Ran single-GPU Wan2.1 T2V profiling (GPU 5)
+- [x] Ran multi-GPU NCCL communication profiling (GPUs 5, 6, 7)
+- [x] Analyzed DistriFusion overlap potential for video generation
 
 ### 2026-01-13: Session Complete
 - [x] Environment setup and verification

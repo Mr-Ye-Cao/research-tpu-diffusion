@@ -1,6 +1,6 @@
 # Communication/Compute Overlap Profiling Report - DiT Architecture
 
-**Date:** January 13, 2026
+**Date:** January 13-14, 2026 (Updated)
 **Author:** Profiling Session
 **Target Model:** Wan2.1 DiT (Diffusion Transformer) 1.3B
 **Hardware:** 8x NVIDIA RTX PRO 6000 Blackwell (96GB VRAM each)
@@ -14,10 +14,30 @@ We profiled **Wan2.1 DiT (Diffusion Transformer) 1.3B** using the **real model**
 
 ### Key Findings
 
+**Phase 1 (PCIe, Simulated):**
 | Parallelism Strategy | Comm % | Potential Speedup |
 |---------------------|--------|-------------------|
-| **Tensor Parallelism** | 41.3% | **1.70x** |
-| **Sequence Parallelism** | 61.0% | **2.57x** |
+| Tensor Parallelism | 41.3% | 1.70x |
+| Sequence Parallelism | 61.0% | 2.57x |
+
+**Phase 2 (NVLink, Real Model - Updated 2026-01-14):**
+
+| Metric | Single GPU | 3 GPU USP |
+|--------|-----------|-----------|
+| **Inference Time** | 7,281 ms | 31,517 ms |
+| **Speedup** | baseline | **0.23x (4.3x slower!)** |
+
+**CRITICAL FINDING:** USP (Ulysses Sequence Parallelism) performance depends heavily on sequence length:
+
+| Frames | Tokens | Single GPU | 3 GPU USP | Speedup |
+|--------|--------|-----------|-----------|---------|
+| 17 | ~5K | 7.3s | 31.5s | **0.23x** (4.3x slower) |
+| 81 | ~24K | 33.6s | 45.2s | **0.74x** (1.34x slower) |
+| 129 | ~39K | 59.5s | 55.9s | **1.07x** |
+| 177 | ~53K | 93.7s | 70.0s | **1.34x** |
+| **241** | **~72K** | **147.8s** | **92.2s** | **1.60x** |
+
+**Crossover point: ~100-129 frames (~30-40K tokens)**. Speedup scales with sequence length!
 
 DistriFusion's activation reuse can hide communication latency by overlapping current step's communication with previous step's computation.
 
@@ -308,6 +328,236 @@ Profiling **Wan2.1 DiT** reveals:
 | NCCL Bandwidth (large tensors) | **198 Gbps** |
 
 These measurements provide critical inputs for the auto-sharding cost model to optimize parallelism strategy selection for Wan2.1 across heterogeneous TPU/GPU networks.
+
+---
+
+## Phase 2: Video Generation Multi-GPU Profiling (2026-01-14)
+
+This section presents **new profiling results** from running actual Wan2.1 video generation on multi-GPU with USP (Ulysses Sequence Parallelism).
+
+### Environment Updates
+
+| Component | Version | Notes |
+|-----------|---------|-------|
+| Flash Attention | **2.8.3** | Built from source for Blackwell (sm_120) |
+| xFuser | 0.4.1 | Provides USP context parallelism |
+| CUDA Arch | sm_120 | RTX PRO 6000 Blackwell |
+
+**Flash Attention on Blackwell Resolution:**
+```bash
+# Blackwell GPUs (sm_120) require source build
+pip install ninja
+TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0;10.0;12.0" pip install flash-attn --no-build-isolation
+# Build takes ~15 minutes
+```
+
+---
+
+### Single GPU Baseline (Updated)
+
+| Parameter | Value |
+|-----------|-------|
+| Model | Wan2.1-T2V-1.3B |
+| Video Size | 480x832 |
+| Frame Count | 17 frames |
+| Inference Steps | 10 |
+| Attention Backend | **Flash Attention 2.8.3** |
+
+**Performance:**
+- **Mean inference time:** 7,534.51 ms
+- **Time per step:** 753.45 ms
+
+---
+
+### Multi-GPU NCCL Communication Benchmarks (3 GPUs)
+
+Using NVLink interconnect between RTX PRO 6000 Blackwell GPUs:
+
+| Operation | Tensor Shape | Size (MB) | Time (ms) | Bandwidth (Gbps) |
+|-----------|--------------|-----------|-----------|------------------|
+| **KV All-Gather** | [1, 1706, 2, 12, 128] | 10.00 | 0.703 | **341.4** |
+| **Attn Output All-Gather** | [1, 1706, 1536] | 5.00 | 0.373 | **321.3** |
+| **FFN All-Reduce** | [1, 5120, 1536] | 15.00 | 0.630 | **253.8** |
+
+**Key Finding:** NVLink achieves **320-341 Gbps** bandwidth, significantly higher than PCIe (~200 Gbps).
+
+---
+
+### Per-Layer Communication Overhead
+
+| Parallelism Strategy | Time per Layer (ms) | Total for 30 Layers (ms) |
+|---------------------|---------------------|--------------------------|
+| **Sequence Parallel (USP)** | 0.747 | 22.40 |
+| **Tensor Parallel** | 1.261 | 37.83 |
+
+---
+
+### Multi-GPU USP (Ulysses) Results
+
+Ran with xFuser USP on 3 GPUs (ulysses_size=3, ring_size=1):
+
+| Metric | Value |
+|--------|-------|
+| World Size | 3 GPUs |
+| Ulysses Size | 3 |
+| Ring Size | 1 |
+| Video Size | 480x832, 17 frames |
+| Inference Steps | 10 |
+| **Mean Inference Time** | 31,517 ms |
+
+**CRITICAL FINDING: USP is SLOWER than single GPU for this workload!**
+
+---
+
+### Root Cause Analysis: xFuserLongContextAttention Overhead
+
+We benchmarked the attention mechanism to understand the slowdown:
+
+| Configuration | Time per Attention | Notes |
+|--------------|-------------------|-------|
+| Flash Attention (local 1706 tokens) | **0.067 ms** | Baseline |
+| xFuserLongContextAttention (same) | **0.922 ms** | **13.73x overhead** |
+| Full sequence (5120 tokens) single GPU | **0.546 ms** | Reference |
+| USP (3 GPUs, 5120 tokens total) | **0.922 ms** | **1.69x slower than single GPU!** |
+
+**Why USP is slower:**
+
+1. **Sequence length is too short** (5120 tokens for 17 frames at 480x832)
+   - xFuser's ring/ulysses attention is designed for 100K+ token sequences
+   - For short sequences, communication overhead dominates compute savings
+
+2. **Per-layer overhead compounds**
+   - 30 transformer layers × 10 diffusion steps = 300 attention operations
+   - Each operation has 13.73x overhead vs regular Flash Attention
+   - Total overhead: ~300 × (0.922 - 0.182) ms = 222 extra seconds
+
+3. **Additional distributed overhead**
+   - All-gather at end of each forward pass
+   - Distributed barriers and synchronization
+
+**When USP WOULD be beneficial:**
+- Much longer videos (81+ frames → 20K+ tokens)
+- Higher resolution (720p, 1080p → more spatial tokens)
+- Target: sequences > 50,000 tokens for communication to be hidden
+
+---
+
+### Crossover Point Analysis (Updated)
+
+We benchmarked different frame counts to find when USP becomes beneficial:
+
+| Frames | Est. Tokens | Single GPU | 3 GPU USP | Speedup | Efficiency |
+|--------|-------------|------------|-----------|---------|------------|
+| 17 | ~5K | 7,281 ms | 31,517 ms | 0.23x | -77% |
+| 81 | ~24K | 33,616 ms | 45,199 ms | 0.74x | -26% |
+| **129** | **~39K** | 59,519 ms | 55,872 ms | **1.07x** | +7% |
+| 177 | ~53K | 93,698 ms | 69,956 ms | **1.34x** | +34% |
+| **241** | **~72K** | **147,802 ms** | **92,188 ms** | **1.60x** | **+60%** |
+
+**Key Findings:**
+1. **Crossover point: ~100-129 frames (~30-40K tokens)**
+2. **Speedup scales with sequence length** - longer videos benefit more from parallelism
+3. At 241 frames (~72K tokens), USP achieves **1.60x speedup** (53% parallel efficiency with 3 GPUs)
+
+**Scaling Analysis:**
+- Ideal 3-GPU speedup: 3.0x
+- At 241 frames: 1.60x achieved = 53% parallel efficiency
+- The efficiency continues to improve with longer sequences
+
+---
+
+### DistriFusion Overlap Analysis (Updated)
+
+**NOTE:** Previous estimates were based on simulated NCCL benchmarks. Actual USP implementation shows much higher overhead due to xFuserLongContextAttention.
+
+**Simulated NCCL (theoretical best case):**
+
+| Parallelism | Comm Time/Step (ms) | Compute Time/Step (ms) | Comm % | Overlap Speedup |
+|-------------|---------------------|------------------------|--------|-----------------|
+| Sequence Parallel (USP) | 22.40 | 251.0 | 8.2% | 1.09x |
+| Tensor Parallel | 37.83 | 251.0 | 13.1% | 1.15x |
+
+**Actual USP Results (xFuser implementation):**
+
+| Metric | Single GPU | 3 GPU USP | Difference |
+|--------|-----------|-----------|------------|
+| Inference Time | 7,281 ms | 31,517 ms | **4.3x slower** |
+| Time per Step | 728 ms | 3,152 ms | **4.3x slower** |
+
+**Key Insight:** The xFuserLongContextAttention overhead (13.73x) makes USP impractical for short sequences. DistriFusion-style overlap cannot help when the parallelization itself adds overhead.
+
+---
+
+### Updated Cost Model Parameters
+
+```python
+# NVLink Communication (RTX PRO 6000 Blackwell)
+NVLINK_ALL_GATHER_BW_GBPS = 341.4    # KV gather
+NVLINK_ALL_REDUCE_BW_GBPS = 253.8    # FFN reduce
+NVLINK_LATENCY_MS = 0.37             # Base latency
+
+# Wan2.1 Video Generation (17 frames, 480x832)
+WAN_SINGLE_GPU_TIME_PER_STEP_MS = 753.45
+WAN_MULTI_GPU_COMPUTE_PER_STEP_MS = 251.0  # with 3 GPUs
+
+# DistriFusion Overlap (NVLink)
+WAN_SP_COMM_PERCENTAGE = 0.082       # 8.2%
+WAN_TP_COMM_PERCENTAGE = 0.131       # 13.1%
+WAN_SP_OVERLAP_SPEEDUP = 1.09
+WAN_TP_OVERLAP_SPEEDUP = 1.15
+```
+
+---
+
+### Comparison: High-Bandwidth vs Low-Bandwidth Networks
+
+| Metric | PCIe (~200 Gbps) | NVLink (~340 Gbps) | Improvement |
+|--------|------------------|--------------------| ------------|
+| KV All-Gather Bandwidth | 183.5 Gbps | **341.4 Gbps** | 1.86x |
+| TP Comm Overhead | 41.3% | **13.1%** | 3.2x lower |
+| SP Comm Overhead | 61.0% | **8.2%** | 7.4x lower |
+| DistriFusion Speedup | 1.70x | 1.15x | Less needed |
+
+**Conclusion:** High-bandwidth interconnects (NVLink/ICI) significantly reduce communication overhead, making DistriFusion less critical but still beneficial.
+
+---
+
+### Strategy Recommendations (Updated Based on Actual Testing)
+
+**For Wan2.1-T2V-1.3B with short videos (17 frames, 480x832):**
+
+| Strategy | Recommendation | Reason |
+|----------|---------------|--------|
+| **Single GPU** | **BEST** | 7.3 seconds, no overhead |
+| **USP (xFuser)** | **NOT RECOMMENDED** | 4.3x slower due to attention overhead |
+| **Data Parallelism** | For larger batches | Near-zero comm overhead |
+| **Tensor Parallelism** | Needs custom impl | xFuser's USP is not TP |
+
+**For long videos (81+ frames, higher resolution):**
+
+| Network Type | Bandwidth | Best Strategy | Notes |
+|--------------|-----------|---------------|-------|
+| NVLink 5.0 | 900 Gbps | USP or TP | Sequences > 50K tokens |
+| NVLink 4.0 | 400 Gbps | TP preferred | USP viable for > 100K tokens |
+| PCIe 5.0 | 200 Gbps | Single GPU or DP | USP overhead too high |
+| DCN | 10-100 Gbps | DP only | Never use SP across nodes |
+
+**Key Takeaway:** Don't assume parallelism is always faster. For short sequences, the overhead from ring/ulysses attention implementations can dominate any parallelization benefit.
+
+---
+
+### Result Files (Phase 2)
+
+```
+./profiling_results/wan_single_gpu/20260114_062914/
+└── results.json              # Single GPU baseline
+
+./profiling_results/wan_nccl/20260114_064727_gpus3/
+└── results.json              # NCCL communication benchmarks
+
+./profiling_results/wan_multi_gpu/20260114_173747_gpus3/
+└── results_rank0.json        # Multi-GPU USP with profiler
+```
 
 ---
 

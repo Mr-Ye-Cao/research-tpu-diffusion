@@ -154,3 +154,156 @@ cat ./profiling_results/dit_distributed/20260113_063738_gpus3/all_results.json
 # View real Wan2.1 results
 cat ./profiling_results/wan_real/20260113_071418/results.json
 ```
+
+---
+
+## Phase 2: Video Generation Multi-GPU Profiling (2026-01-14)
+
+### Distrifuser Repository Setup
+
+```bash
+cd /home/ye/workspace/tpu/research-tpu-diffusion
+
+# Clone distrifuser repo
+git clone https://github.com/Mr-Ye-Cao/distrifuser.git
+
+# Create video-gen branch
+cd distrifuser
+git checkout -b video-gen
+```
+
+### Single GPU Wan2.1 Video Generation Profiling
+
+```bash
+cd /home/ye/workspace/tpu/research-tpu-diffusion
+
+# Profile on a single free GPU (e.g., GPU 5)
+CUDA_VISIBLE_DEVICES=5 python distrifuser/scripts/profile_wan_video.py \
+    --mode single \
+    --gpu_id 0 \
+    --frame_num 17 \
+    --num_steps 10 \
+    --warmup_runs 1 \
+    --profile_runs 2
+
+# Results saved to: profiling_results/wan_single_gpu/<timestamp>/
+```
+
+### Multi-GPU NCCL Communication Profiling
+
+```bash
+cd /home/ye/workspace/tpu/research-tpu-diffusion
+
+# Profile NCCL communication on 3 free GPUs (e.g., GPUs 5, 6, 7)
+CUDA_VISIBLE_DEVICES=5,6,7 torchrun --nproc_per_node=3 \
+    distrifuser/scripts/profile_wan_nccl.py
+
+# Results saved to: profiling_results/wan_nccl/<timestamp>_gpus3/
+```
+
+### Multi-GPU Wan2.1 with USP (Requires Flash Attention)
+
+```bash
+# First, install Flash Attention for Blackwell GPUs (takes ~15 minutes)
+pip install ninja  # Required for fast compilation
+TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0;10.0;12.0" pip install flash-attn --no-build-isolation
+
+# Verify flash-attn works on Blackwell
+python -c "import flash_attn; print(f'Flash Attention: {flash_attn.__version__}')"
+
+# Run multi-GPU profiling with USP
+cd /home/ye/workspace/tpu/research-tpu-diffusion
+
+CUDA_VISIBLE_DEVICES=5,6,7 torchrun --nproc_per_node=3 \
+    distrifuser/scripts/profile_wan_video.py \
+    --mode multi \
+    --ulysses_size 3 \
+    --ring_size 1 \
+    --frame_num 17 \
+    --num_steps 10 \
+    --warmup_runs 1 \
+    --profile_runs 2
+```
+
+### Run Original Wan2.1 with xDiT Context Parallelism
+
+```bash
+cd /home/ye/workspace/tpu/research-tpu-diffusion/Wan2.1
+
+# Run with Ulysses parallelism on 3 GPUs (requires Flash Attention)
+CUDA_VISIBLE_DEVICES=5,6,7 torchrun --nproc_per_node=3 generate.py \
+    --task t2v-1.3B \
+    --size 480*832 \
+    --ckpt_dir ../Wan2.1-T2V-1.3B \
+    --prompt "Two anthropomorphic cats in boxing gear fight on a spotlighted stage." \
+    --ulysses_size 3 \
+    --ring_size 1 \
+    --sample_steps 50 \
+    --frame_num 81 \
+    --t5_cpu
+```
+
+### View New Results
+
+```bash
+# View single GPU video generation results
+cat profiling_results/wan_single_gpu/*/results.json | jq .
+
+# View NCCL communication benchmark results
+cat profiling_results/wan_nccl/*/results.json | jq .
+```
+
+### Key Results (2026-01-14)
+
+#### Single GPU (Wan2.1-T2V-1.3B, 480x832, 17 frames, 10 steps)
+- Mean inference time: **7,281 ms**
+- Time per step: **728 ms**
+
+#### Multi-GPU USP (3 GPUs with xFuser)
+- Mean inference time: **31,517 ms**
+- Time per step: **3,152 ms**
+- **Result: 4.3x SLOWER than single GPU!**
+
+#### Root Cause: xFuserLongContextAttention Overhead
+| Configuration | Time | Overhead |
+|---------------|------|----------|
+| Flash Attention (1706 tokens) | 0.067 ms | baseline |
+| xFuserLongContextAttention (same) | 0.922 ms | **13.73x** |
+| Full sequence (5120 tokens) single GPU | 0.546 ms | - |
+| USP (3 GPUs, 5120 tokens total) | 0.922 ms | **1.69x slower** |
+
+#### Crossover Point Analysis (Frames vs Performance)
+| Frames | Est. Tokens | Single GPU | 3 GPU USP | Speedup |
+|--------|-------------|------------|-----------|---------|
+| 17 | ~5K | 7,281 ms | 31,517 ms | 0.23x (4.3x slower) |
+| 81 | ~24K | 33,616 ms | 45,199 ms | 0.74x (1.34x slower) |
+| 129 | ~39K | 59,519 ms | 55,872 ms | **1.07x** |
+| 177 | ~53K | 93,698 ms | 69,956 ms | **1.34x** |
+| **241** | **~72K** | **147,802 ms** | **92,188 ms** | **1.60x** |
+
+#### Conclusion
+- **Crossover point: ~100-129 frames (~30-40K tokens)**
+- **Speedup scales with sequence length**
+- At 241 frames: 1.60x speedup (53% parallel efficiency)
+- For short videos (< 100 frames): use single GPU
+- For long videos (> 129 frames): USP provides significant speedup
+
+### Benchmark Commands (No Profiler Overhead)
+
+```bash
+# Single GPU benchmark
+CUDA_VISIBLE_DEVICES=5 python distrifuser/scripts/benchmark_wan_single.py
+
+# Multi-GPU benchmark (USP)
+CUDA_VISIBLE_DEVICES=5,6,7 torchrun --nproc_per_node=3 distrifuser/scripts/benchmark_wan_multi.py
+
+# Test xFuserLongContextAttention overhead
+CUDA_VISIBLE_DEVICES=5,6,7 torchrun --nproc_per_node=3 distrifuser/scripts/test_usp_minimal.py
+```
+
+#### NCCL Communication (theoretical best case)
+| Operation | Size (MB) | Time (ms) | Bandwidth (Gbps) |
+|-----------|-----------|-----------|------------------|
+| KV All-Gather | 10.00 | 0.703 | 341.4 |
+| Attn All-Gather | 5.00 | 0.373 | 321.3 |
+| FFN All-Reduce | 15.00 | 0.630 | 253.8 |
