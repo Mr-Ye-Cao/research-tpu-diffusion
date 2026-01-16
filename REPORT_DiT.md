@@ -607,15 +607,21 @@ After warmup (steps 4+): [Compute] → [Async All-Reduce] → return cached outp
 
 **Why DistriFusion doesn't help for Wan2.1 Video Generation:**
 
-1. **CFG breaks temporal similarity**
-   - Classifier-Free Guidance alternates unconditional/conditional forward passes
-   - Cached activations from unconditional don't match conditional inputs
-   - DistriFusion assumes similar activations between timesteps
+1. **CFG breaks temporal similarity (Implementation Bug)**
+   - Classifier-Free Guidance runs 2 forward passes per step: Unconditional → Conditional
+   - Our implementation uses a **single cache** that mixes both passes:
+     ```
+     Uncond(t): reads cache from Cond(t-1)   ❌ MISMATCH
+     Cond(t):   reads cache from Uncond(t)   ❌ MISMATCH
+     ```
+   - DistriFusion requires: `Uncond(t) ≈ Uncond(t-1)` and `Cond(t) ≈ Cond(t-1)`
+   - **Fix needed:** Separate caches for unconditional/conditional, or batched CFG
 
-2. **Too many all-reduces per forward pass**
+2. **Too many all-reduces per forward pass (Latency Dominance)**
    - 30 transformer layers × 3 operations (self-attn, cross-attn, FFN) = **90 all-reduces**
    - With CFG: 2 forward passes × 90 = **180 all-reduces per diffusion step**
-   - Cumulative latency dominates any overlap benefit
+   - Even with fast NVLink, launching 180 NCCL kernels creates cumulative latency
+   - DistriFusion needs `ComputeTime >> CommTime`, but here `CommTime ≈ ComputeTime`
 
 3. **DistriFusion was designed for different architecture**
    | | Original DistriFusion | Our Implementation |

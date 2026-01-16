@@ -310,9 +310,12 @@ distrifuser/distrifuser/
 ### Analysis: Why DistriFusion Doesn't Help for Video/DiT
 
 **Root Cause**:
-1. **CFG breaks temporal similarity**: Classifier-free guidance alternates unconditional/conditional forward passes, so cached activations come from different inputs
-2. **Too many all-reduces**: 90 all-reduces per forward pass (30 layers × 3 ops)
-3. **Limited overlap window**: Layer i's async overlaps with layers i+1 to N's compute, but cumulative latency dominates
+1. **CFG breaks temporal similarity (Implementation Bug)**:
+   - CFG runs Unconditional → Conditional per step
+   - Single cache mixes both: `Uncond(t)` reads `Cond(t-1)` cache ❌
+   - Fix needed: Separate caches or batched CFG
+2. **Too many all-reduces**: 90 all-reduces per forward (180 with CFG)
+3. **Latency dominance**: `CommTime ≈ ComputeTime`, insufficient overlap window
 
 **DistriFusion Original Design vs Our Implementation**:
 | | Original Paper | Our Implementation |
@@ -391,6 +394,64 @@ CUDA_VISIBLE_DEVICES=5,6 torchrun --nproc_per_node=2 \
 1. CFG breaks temporal similarity assumption
 2. Too many all-reduces (90 per forward pass)
 3. Use USP (Sequence Parallelism) for long videos instead
+
+### 2026-01-16: PipeFusion for Wan2.1 (xDiT approach)
+
+**Goal**: Adapt xDiT's PipeFusion approach to Wan2.1 video generation.
+
+**Key Difference from TP**:
+- TP: 90 all-reduces per forward pass
+- PipeFusion: CFG batch split (0 all-reduces per forward)
+
+**Files Created**:
+- `xDiT/pipefuser/modules/wan/attn.py` - PipeFusion attention wrappers
+- `xDiT/pipefuser/models/wan/distri_wan_pipefusion.py` - Model wrapper
+- `xDiT/scripts/test_pipefusion_modules.py` - Module tests
+
+**Test Results** (GPU 6, seq_len=7800):
+| Component | Time | Notes |
+|-----------|------|-------|
+| Self-attention wrapper | 103.64 ms | Delegates to original (3D RoPE) |
+| Cross-attention wrapper | 0.65 ms | Fresh KV computation |
+| Cross-attention cached | 0.51 ms | **1.26x speedup** from KV caching |
+
+**Status**:
+- [x] PipeFusion attention modules work correctly
+- [x] Cross-attention KV caching verified
+- [x] Multi-GPU CFG batch combination (requires output gathering)
+- [x] Full benchmark completed
+
+**Benchmark Results** (17 frames, 5 steps, 480x832):
+
+| Configuration | Inference Time | Time/Step | vs Single GPU |
+|---------------|----------------|-----------|---------------|
+| Single GPU (with CFG) | 1,560.82 ms | 312.16 ms | baseline |
+| 2 GPUs (PipeFusion CFG) | 806.54 ms | 161.31 ms | **1.94x speedup** |
+
+**Key Finding**: PipeFusion achieves near-linear 2x speedup with 2 GPUs!
+
+**Why PipeFusion works better than TP for video/DiT:**
+1. **Zero all-reduces per forward pass** (vs 90 for TP)
+2. **CFG batch split**: Rank 0 = Unconditional, Rank 1 = Conditional
+3. **Only 1 all-gather per step** (latent size: ~5MB)
+4. **Communication overhead: <3%**
+
+**Usage:**
+```bash
+# PipeFusion CFG benchmark (2 GPUs)
+CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 \
+    xDiT/scripts/benchmark_wan_pipefusion_cfg.py \
+    --frame_num 17 --num_steps 5
+
+# Single GPU baseline
+CUDA_VISIBLE_DEVICES=6 python xDiT/scripts/benchmark_wan_single_gpu.py \
+    --frame_num 17 --num_steps 5
+```
+
+**Files Created:**
+- `xDiT/scripts/benchmark_wan_pipefusion_cfg.py` - 2-GPU CFG split benchmark
+- `xDiT/scripts/benchmark_wan_single_gpu.py` - Single GPU baseline
+- `xDiT/scripts/debug_minimal.py` - Minimal forward pass test
 
 ### 2026-01-14: Video Generation Multi-GPU Profiling
 - [x] Cloned distrifuser repo (https://github.com/Mr-Ye-Cao/distrifuser.git)
