@@ -1,6 +1,6 @@
 # Communication/Compute Overlap Profiling Report - DiT Architecture
 
-**Date:** January 13-15, 2026 (Updated)
+**Date:** January 13-17, 2026 (Updated)
 **Author:** Profiling Session
 **Target Model:** Wan2.1 DiT (Diffusion Transformer) 1.3B
 **Hardware:** 8x NVIDIA RTX PRO 6000 Blackwell (96GB VRAM each)
@@ -39,7 +39,7 @@ We profiled **Wan2.1 DiT (Diffusion Transformer) 1.3B** using the **real model**
 
 **Crossover point: ~100-129 frames (~30-40K tokens)**. Speedup scales with sequence length!
 
-**Phase 3 (DistriFusion Implementation - 2026-01-15):**
+**Phase 3 (DistriFusion Tensor Parallelism - 2026-01-15):**
 
 | Configuration | Inference Time | vs Single GPU |
 |---------------|----------------|---------------|
@@ -51,6 +51,16 @@ We profiled **Wan2.1 DiT (Diffusion Transformer) 1.3B** using the **real model**
 1. CFG breaks temporal similarity assumption (alternating unconditional/conditional)
 2. 90 all-reduces per forward pass (30 layers × 3 ops) creates cumulative latency
 3. DistriFusion was designed for Patch Parallelism (sparse halo), not Tensor Parallelism (dense all-reduce)
+
+**Phase 4 (DistriFusion Sequence Splitting vs CFG Parallelism - 2026-01-17):**
+
+| Method | Inference Time (5 steps) | Speedup |
+|--------|--------------------------|---------|
+| Single GPU | 1,566.94 ms | 1x |
+| DistriFusion (Seq Split, 2 GPU) | 1,298.88 ms | **1.21x** |
+| **CFG Parallelism** (2 GPU) | 807.16 ms | **1.94x** |
+
+**BEST APPROACH:** CFG Parallelism achieves near-ideal 2x speedup by splitting uncond/cond across GPUs with only 1 all-gather per step. DistriFusion (sequence splitting) is slower due to 62 all-gathers per step.
 
 ---
 
@@ -710,3 +720,124 @@ CUDA_VISIBLE_DEVICES=5,6 torchrun --nproc_per_node=2 \
 | (1, 4096, 1536) | 12.0 | 0.71 |
 | (1, 8192, 1536) | 24.0 | 1.37 |
 | (1, 16384, 1536) | 48.0 | 2.71 |
+
+---
+
+## Phase 4: DistriFusion (Sequence Splitting) in xDiT (2026-01-17)
+
+We implemented DistriFusion with **sequence splitting** (not tensor parallelism) for Wan2.1 inside xDiT and compared it with **CFG Parallelism**.
+
+### Implementation Overview
+
+**DistriFusion (Sequence Splitting):**
+- Split sequence across GPUs: each GPU processes `seq_len / n_gpus` tokens
+- Self-attention: all-gather KV from all GPUs
+- After warmup: use stale KV from previous timestep + async update
+- Cross-attention: cache text KV (doesn't change)
+- FFN: token-wise, no communication
+
+**CFG Parallelism (Batch Splitting):**
+- Split CFG batch: Rank 0 = unconditional, Rank 1 = conditional
+- Each GPU runs 1 forward pass per step (not 2)
+- All-gather outputs at end of step for CFG combination
+- 1 all-gather per step vs 30+ all-gathers per step
+
+### Benchmark Results (2 GPUs, 17 frames, 5 steps, 480×832)
+
+| Method | Inference Time | Time/Step | Speedup |
+|--------|----------------|-----------|---------|
+| **Single GPU** | 1,566.94 ms | 313.39 ms | 1x |
+| **DistriFusion** (2 GPUs) | 1,298.88 ms | 259.78 ms | **1.21x** |
+| **CFG Parallelism** (2 GPUs) | 807.16 ms | 161.43 ms | **1.94x** |
+
+### Analysis: Why CFG Parallelism Beats DistriFusion
+
+| Factor | DistriFusion | CFG Parallelism |
+|--------|--------------|-----------------|
+| **Forward passes per GPU** | 2 (uncond + cond) | 1 (either uncond OR cond) |
+| **All-gathers per step** | 30+ (each attention layer) | 1 (final output only) |
+| **Communication volume** | High (KV for each layer) | Low (just latent output) |
+| **Compute savings** | 50% tokens per GPU | 50% forward passes per GPU |
+| **Stale KV benefit** | Limited (CFG mixes uncond/cond) | N/A |
+
+**Key Insight:** CFG Parallelism achieves near-ideal 2x speedup because:
+1. Each GPU does exactly half the compute (1 forward instead of 2)
+2. Only 1 all-gather per step (minimal communication)
+3. No complex caching or async communication needed
+
+DistriFusion underperforms because:
+1. Still runs 2 forward passes per step (both uncond and cond)
+2. 30 all-gathers per forward pass adds significant overhead
+3. Stale KV benefit is limited when alternating uncond/cond
+
+### Communication Comparison
+
+| Operation | DistriFusion per Step | CFG Parallelism per Step |
+|-----------|----------------------|--------------------------|
+| All-gather KV | 30 × 2 = 60 | 0 |
+| All-gather output | 2 | 1 |
+| **Total all-gathers** | **62** | **1** |
+
+### Files Created in xDiT
+
+```
+xDiT/pipefuser/modules/wan/
+├── distrifusion_attn.py       # DistriFusion attention with 3D RoPE
+├── distrifusion_model.py      # DistriFusion model wrapper
+└── __init__.py                # Updated exports
+
+xDiT/scripts/
+├── benchmark_wan_distrifusion.py  # DistriFusion benchmark
+├── benchmark_wan_pipefusion_cfg.py  # CFG parallelism benchmark
+└── benchmark_wan_single_gpu.py      # Single GPU baseline
+```
+
+### Reproduction Commands
+
+```bash
+# Single GPU baseline
+CUDA_VISIBLE_DEVICES=6 python scripts/benchmark_wan_single_gpu.py \
+    --num_steps=5 --warmup_runs=1 --benchmark_runs=2
+
+# DistriFusion (2 GPUs)
+CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 \
+    scripts/benchmark_wan_distrifusion.py \
+    --num_steps=5 --warmup_runs=1 --benchmark_runs=2
+
+# CFG Parallelism (2 GPUs)
+CUDA_VISIBLE_DEVICES=6,7 torchrun --nproc_per_node=2 \
+    scripts/benchmark_wan_pipefusion_cfg.py \
+    --num_steps=5 --warmup_runs=1 --benchmark_runs=2
+```
+
+### Conclusions
+
+**For Wan2.1 video generation with CFG:**
+
+| Scenario | Recommended Strategy | Expected Speedup |
+|----------|---------------------|------------------|
+| Short videos (<100 frames), 2 GPUs | **CFG Parallelism** | ~2x |
+| Short videos, 4+ GPUs | CFG + Sequence Parallelism | ~3-4x |
+| Long videos (>129 frames) | **USP (Sequence Parallel)** | 1.6x+ |
+
+**DistriFusion (sequence splitting) is NOT optimal for CFG-based models** because:
+1. CFG requires 2 forward passes regardless of sequence splitting
+2. Communication overhead (30 all-gathers/forward) is too high
+3. CFG Parallelism's batch splitting is more efficient (1 all-gather/step)
+
+**DistriFusion is designed for:**
+- Image generation (single forward pass per step)
+- Patch parallelism with sparse halo exchange
+- Models without CFG or with batched CFG
+
+---
+
+## Updated Strategy Matrix (2026-01-17)
+
+| Strategy | Best Use Case | Wan2.1 Performance |
+|----------|---------------|-------------------|
+| **Single GPU** | Short videos (<100 frames) | baseline |
+| **CFG Parallelism** | 2 GPUs with CFG | **1.94x** |
+| **DistriFusion (Seq Split)** | Without CFG | 1.21x |
+| **Tensor Parallelism** | Large models | 4.2x slower |
+| **USP (Sequence)** | Long videos (>129 frames) | 1.60x+ |
